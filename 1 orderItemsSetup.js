@@ -77,6 +77,8 @@ function normalizeAndEnrichOrderItems_(opts) {
   const logMissingSku = !!(CFG.DERIVE && CFG.DERIVE.ON_MISSING_SKU && CFG.DERIVE.ON_MISSING_SKU.LOG_EXCEPTION);
 
   let changedCount = 0;
+  let removedDigitalCount = 0;
+  const sheetRowsToDelete = [];
 
   for (let r = 0; r < scan.numRows; r++) {
     const row = values[r];
@@ -98,6 +100,19 @@ function normalizeAndEnrichOrderItems_(opts) {
     // Step 2: enrich & gate
     const sku = String(row[iSKU] || "").trim();
     const qty = toInt_(row[iQty], 0);
+
+    // Rule: digital items (BDD SKU suffix) are removed from OrderItems entirely.
+    if (isDigitalSku_(sku)) {
+      outCreatedAt[r] = [row[iCreatedAt]];
+      outCategory[r] = [row[iCategory]];
+      outProfileKey[r] = [row[iProfileKey]];
+      outUnits[r] = [row[iUnits]];
+      outReady[r] = [row[iReady]];
+
+      sheetRowsToDelete.push(scan.startRow + r);
+      removedDigitalCount++;
+      continue;
+    }
 
     const currentReady = isTrue_(row[iReady]);
     const catBlankish = isBlankish_(row[iCategory], blankishValues);
@@ -202,14 +217,47 @@ function normalizeAndEnrichOrderItems_(opts) {
     shX.getRange(shX.getLastRow() + 1, 1, exceptionRows.length, exceptionRows[0].length).setValues(exceptionRows);
   }
 
-  setOrderItemsCheckpoint_(scan.endRow);
+  if (sheetRowsToDelete.length) {
+    deleteRowsByIndices_(shOI, sheetRowsToDelete);
+  }
+
+  const checkpointRow = shOI.getLastRow();
+  setOrderItemsCheckpoint_(checkpointRow);
 
   return {
     scanned: scan.numRows,
     changed: changedCount,
+    removedDigital: removedDigitalCount,
     exceptions: exceptionRows.length,
-    checkpointSetToRow: scan.endRow
+    checkpointSetToRow: checkpointRow
   };
+}
+
+function isDigitalSku_(sku) {
+  const s = String(sku || "").trim().toUpperCase();
+  return !!s && s.endsWith("BDD");
+}
+
+function deleteRowsByIndices_(sh, sheetRows1) {
+  const rows = Array.from(new Set((sheetRows1 || []).map(x => parseInt(x, 10)).filter(x => Number.isFinite(x) && x >= 2)))
+    .sort((a, b) => b - a);
+  if (!rows.length) return;
+
+  let runStart = rows[0];
+  let runLen = 1;
+
+  for (let i = 1; i < rows.length; i++) {
+    const cur = rows[i];
+    if (cur === runStart - runLen) {
+      runLen++;
+    } else {
+      sh.deleteRows(runStart - runLen + 1, runLen);
+      runStart = cur;
+      runLen = 1;
+    }
+  }
+
+  sh.deleteRows(runStart - runLen + 1, runLen);
 }
 
 function buildSkuMap_(shM, idx) {
