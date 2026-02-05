@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body { font-family: Arial, sans-serif; margin: 12px; color: #202124; }
+      .row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+      input[type="text"], select { width: 100%; padding: 6px; box-sizing: border-box; }
+      button { padding: 6px 10px; cursor: pointer; }
+      .muted { color: #5f6368; font-size: 12px; }
+      .list { border: 1px solid #dadce0; border-radius: 6px; max-height: 520px; overflow: auto; }
+      .item { border-bottom: 1px solid #eee; padding: 8px; }
+      .item:last-child { border-bottom: none; }
+      .title { font-weight: 600; }
+      .meta { font-size: 12px; color: #5f6368; margin-top: 4px; }
+      .toolbar { display:flex; gap:8px; margin: 10px 0; }
+      .pill { display:inline-block; font-size:11px; border-radius:10px; padding:2px 8px; background:#e8f0fe; color:#174ea6; }
+      .statusline { display:flex; justify-content:space-between; align-items:center; margin:8px 0; }
+    </style>
+  </head>
+  <body>
+    <h3 style="margin:0 0 10px;">Order Queue</h3>
+
+    <div class="row">
+      <input id="search" type="text" placeholder="Search order/postcode" />
+      <button onclick="load()">Search</button>
+    </div>
+
+    <div class="row">
+      <select id="statusFilter" onchange="load()">
+        <option value="New">New</option>
+        <option value="In Production">In Production</option>
+        <option value="Ready to Pack">Ready to Pack</option>
+      </select>
+      <button onclick="refresh()">Refresh</button>
+    </div>
+
+    <div class="toolbar">
+      <button onclick="bulkUpdate('In Production')">Move selected → In Production</button>
+      <button onclick="bulkUpdate('Ready to Pack')">Move selected → Ready to Pack</button>
+    </div>
+
+    <div class="statusline">
+      <span id="summary" class="muted">Loading…</span>
+      <span id="feedback" class="pill" style="display:none;"></span>
+    </div>
+
+    <div id="list" class="list"></div>
+
+    <script>
+      function escapeHtml(s) {
+        return String(s || '')
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#39;');
+      }
+
+      function getSelectedOrders() {
+        const checks = Array.from(document.querySelectorAll('input.order-check:checked'));
+        return checks.map(c => c.value);
+      }
+
+      function showFeedback(msg) {
+        const el = document.getElementById('feedback');
+        el.textContent = msg;
+        el.style.display = 'inline-block';
+        setTimeout(() => { el.style.display = 'none'; }, 2500);
+      }
+
+      function render(data) {
+        const list = document.getElementById('list');
+        const summary = document.getElementById('summary');
+
+        summary.textContent = `${data.count} order(s) in ${data.status}`;
+
+        if (!data.items.length) {
+          list.innerHTML = '<div class="item muted">No matching orders.</div>';
+          return;
+        }
+
+        list.innerHTML = data.items.map(it => `
+          <div class="item">
+            <div class="row" style="margin-bottom:0;">
+              <input class="order-check" type="checkbox" value="${escapeHtml(it.orderName)}" />
+              <div style="flex:1;">
+                <div class="title">${escapeHtml(it.orderName)}</div>
+                <div class="meta">
+                  ${escapeHtml(it.status)}
+                  ${it.postcode ? ' • ' + escapeHtml(it.postcode) : ''}
+                  ${it.createdAtDisplay ? ' • ' + escapeHtml(it.createdAtDisplay) : ''}
+                </div>
+              </div>
+            </div>
+          </div>
+        `).join('');
+      }
+
+      function load() {
+        const status = document.getElementById('statusFilter').value;
+        const search = document.getElementById('search').value;
+
+        google.script.run
+          .withSuccessHandler(render)
+          .withFailureHandler(err => showFeedback(err.message || String(err)))
+          .getOrderQueueData_({ status, search, limit: 200 });
+      }
+
+      function refresh() {
+        load();
+      }
+
+      function bulkUpdate(targetStatus) {
+        const orderNames = getSelectedOrders();
+        if (!orderNames.length) {
+          showFeedback('Select at least one order');
+          return;
+        }
+
+        google.script.run
+          .withSuccessHandler(res => {
+            showFeedback(`Updated ${res.updated}, skipped ${res.skipped}`);
+            load();
+          })
+          .withFailureHandler(err => showFeedback(err.message || String(err)))
+          .updateOrderStatuses_({ targetStatus, orderNames });
+      }
+
+      document.getElementById('search').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') load();
+      });
+
+      load();
+    </script>
+  </body>
+</html>

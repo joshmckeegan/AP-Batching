@@ -8,6 +8,9 @@ function onOpen() {
 
   const m = ui.createMenu("Batch Tracking");
 
+  // Queue sidebar
+  m.addItem("Open: Order Queue Sidebar", "openOrdersSidebar")
+
   // Order pipeline
   m.addItem("Run: Process Waiting Orders", "processWaitingOrders")
     .addItem("One-off: Repair Derived Fields + ReadyForOrders (full rescan)", "forceRepairReadyForOrdersOneOff")
