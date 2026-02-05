@@ -3,11 +3,6 @@
  *
  * Watch-folder Royal Mail manifest import:
  * Watch Folder (.xls/.xlsx) -> convert -> parse -> upsert Shipments -> mirror Orders -> mirror BatchOrders -> update Batches shorthand -> archive file
- *
- * Assumes you already have:
- * - CFG (Config) with CFG.SHEETS + CFG.COLS mappings
- * - helpers: headerMap_(), requireCol_(), getHeaders_(), parseDate_(), mergeNewlineList_(), normTrackingStatus_()
- * - Advanced Drive Service enabled (Drive.Files.*)
  */
 
 /**
@@ -42,9 +37,6 @@ function setupShipmentsSheet() {
   sh.getRange(1, 1, 1, headers.length).setFontWeight("bold");
 }
 
-/**
- * Install time-based trigger for pollRoyalMailWatchFolder().
- */
 function installRoyalMailWatchTrigger() {
   removeRoyalMailWatchTrigger();
 
@@ -56,9 +48,6 @@ function installRoyalMailWatchTrigger() {
     .create();
 }
 
-/**
- * Remove any existing triggers pointing at pollRoyalMailWatchFolder().
- */
 function removeRoyalMailWatchTrigger() {
   ScriptApp.getProjectTriggers().forEach(t => {
     if (t.getHandlerFunction() === "pollRoyalMailWatchFolder") ScriptApp.deleteTrigger(t);
@@ -67,7 +56,6 @@ function removeRoyalMailWatchTrigger() {
 
 /**
  * Poll watch folder for new .xls/.xlsx exports, import them, then move to archive.
- * Uses DocumentProperties to avoid reprocessing the same file ID repeatedly.
  */
 function pollRoyalMailWatchFolder() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -79,6 +67,10 @@ function pollRoyalMailWatchFolder() {
   try {
     const watchId = CFG.ROYAL_MAIL && CFG.ROYAL_MAIL.WATCH_FOLDER_ID;
     const archiveId = CFG.ROYAL_MAIL && CFG.ROYAL_MAIL.ARCHIVE_FOLDER_ID;
+    const maxFilesPerRun = (CFG.ROYAL_MAIL && CFG.ROYAL_MAIL.MAX_FILES_PER_RUN)
+      ? Math.max(1, parseInt(CFG.ROYAL_MAIL.MAX_FILES_PER_RUN, 10) || 1)
+      : 5;
+
     if (!watchId) throw new Error("CFG.ROYAL_MAIL.WATCH_FOLDER_ID is not set.");
     if (!archiveId) throw new Error("CFG.ROYAL_MAIL.ARCHIVE_FOLDER_ID is not set.");
 
@@ -102,29 +94,24 @@ function pollRoyalMailWatchFolder() {
 
     if (!candidates.length) return;
 
-    // Oldest first
     candidates.sort((a, b) => a.getLastUpdated().getTime() - b.getLastUpdated().getTime());
 
     let filesDone = 0;
-
     for (const file of candidates) {
-      const result = importRoyalMailManifestFile_(file);
+      if (filesDone >= maxFilesPerRun) break;
 
-      // Mark processed
+      const result = importRoyalMailManifestFile_(file);
       processed.add(file.getId());
       filesDone++;
 
-      // Move original to archive
       archive.addFile(file);
       watch.removeFile(file);
 
-      // Toast for manual runs
       ss.toast(`RM import: ${file.getName()} (shipments +${result.newShipments})`, "Royal Mail", 5);
     }
 
     props.setProperty(processedKey, JSON.stringify(Array.from(processed)));
     ss.toast(`Royal Mail: processed ${filesDone} file(s).`, "Royal Mail", 8);
-
   } finally {
     lock.releaseLock();
   }
@@ -132,12 +119,10 @@ function pollRoyalMailWatchFolder() {
 
 /**
  * Convert, parse, upsert Shipments, mirror Orders/BatchOrders, update Batches shorthand.
- * Returns { newShipments }.
  */
 function importRoyalMailManifestFile_(file) {
   const sourceFileName = file.getName();
 
-  // Convert to Google Sheet (Advanced Drive Service)
   const converted = convertToGoogleSheet_(file.getId(), sourceFileName);
   const convertedId = converted.id;
 
@@ -150,7 +135,6 @@ function importRoyalMailManifestFile_(file) {
     const headers = values[0].map(h => String(h || "").trim());
     const idx = (name) => headers.indexOf(name);
 
-    // Exact RM headers (as provided by you)
     const meta = {
       iOrderName: idx("Channel reference"),
       iRmBatch: idx("Batch number"),
@@ -167,38 +151,31 @@ function importRoyalMailManifestFile_(file) {
 
     const required = [
       ["Channel reference", meta.iOrderName],
-      ["Postcode", meta.iPostcode]
+      ["Postcode", meta.iPostcode],
       ["Batch number", meta.iRmBatch],
       ["Manifest number", meta.iManifest],
       ["Despatch date", meta.iDespatch],
       ["Tracking number", meta.iTracking],
       ["Tracking status", meta.iTrackingStatus],
     ];
+
     const missing = required.filter(x => x[1] < 0).map(x => x[0]);
     if (missing.length) throw new Error("RM export missing columns: " + missing.join(", "));
 
     const rows = values.slice(1);
-
     const up = upsertShipmentsFromRMRows_(rows, meta);
     const touched = up.orderNamesTouched;
 
-    // Mirror pipeline
     mirrorShipmentsToOrders_(touched);
     mirrorOrdersToBatchOrders_(touched);
     updateBatchesRoyalMailShorthandFromBatchOrders_(touched);
 
     return { newShipments: up.appendedCount };
-
   } finally {
-    // Trash the converted temp sheet
     try { DriveApp.getFileById(convertedId).setTrashed(true); } catch (e) {}
   }
 }
 
-/**
- * Convert Excel -> Google Sheet.
- * Requires Advanced Drive Service enabled (Drive.Files.*).
- */
 function convertToGoogleSheet_(fileId, fileName) {
   const resource = {
     title: fileName.replace(/\.(xls|xlsx)$/i, "") + " (Converted)",
@@ -209,7 +186,7 @@ function convertToGoogleSheet_(fileId, fileName) {
 
 /**
  * Upsert Shipments rows from RM export.
- * ShipmentID is stable: `${OrderName}|${TrackingNumber}` and is never modified.
+ * ShipmentID is stable: `${OrderName}|${TrackingNumber}`.
  */
 function upsertShipmentsFromRMRows_(rows, meta) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -221,7 +198,7 @@ function upsertShipmentsFromRMRows_(rows, meta) {
 
   const iShipmentID = requireCol_(map, c.ShipmentID);
   const iOrderName  = requireCol_(map, c.OrderName);
-  const iPostcode   = requireCol_(map, c.Postcode);              // NEW
+  const iPostcode   = requireCol_(map, c.Postcode);
   const iTracking   = requireCol_(map, c.RoyalMailTrackingNumber);
   const iTStatus    = requireCol_(map, c.TrackingStatus);
   const iManifest   = requireCol_(map, c.RoyalMailManifestNo);
@@ -237,7 +214,6 @@ function upsertShipmentsFromRMRows_(rows, meta) {
   const lastCol = sh.getLastColumn();
   const existing = (lastRow >= 2) ? sh.getRange(2, 1, lastRow - 1, lastCol).getValues() : [];
 
-  // ShipmentID -> index in `existing`
   const byId = new Map();
   for (let r = 0; r < existing.length; r++) {
     const id = String(existing[r][iShipmentID] || "").trim();
@@ -247,17 +223,15 @@ function upsertShipmentsFromRMRows_(rows, meta) {
   const headers = getHeaders_(sh);
   const now = new Date();
 
-  let updatedAny = false;
   let appendedCount = 0;
-  const toAppend = [];
+  const appendRows = [];
+  const changedRows = [];
   const touched = new Set();
-
-  // Dedup within this file for safety
   const seenInFile = new Set();
 
   for (const r of rows) {
     const orderName = String(r[meta.iOrderName] || "").trim();
-    const postcode = String(r[meta.iPostcode] || "").trim();          // NEW
+    const postcode = String(r[meta.iPostcode] || "").trim();
     const tracking = String(r[meta.iTracking] || "").trim();
     const trackingStatus = String(r[meta.iTrackingStatus] || "").trim();
 
@@ -271,7 +245,7 @@ function upsertShipmentsFromRMRows_(rows, meta) {
 
     const manifest = String(r[meta.iManifest] || "").trim();
     const rmBatch  = String(r[meta.iRmBatch] || "").trim();
-    const despatchedAt = parseDate_(r[meta.iDespatch]) || ""; // true datetime
+    const despatchedAt = parseDate_(r[meta.iDespatch]) || "";
     const service = (meta.iService >= 0) ? String(r[meta.iService] || "").trim() : "";
     const pkgSize = (meta.iPkgSize >= 0) ? String(r[meta.iPkgSize] || "").trim() : "";
     const weight  = (meta.iWeightKg >= 0) ? r[meta.iWeightKg] : "";
@@ -280,9 +254,8 @@ function upsertShipmentsFromRMRows_(rows, meta) {
       const idx = byId.get(shipmentId);
       const row = existing[idx];
 
-      // Do NOT modify ShipmentID (stable key)
       row[iOrderName] = orderName;
-      row[iPostcode] = postcode;              // NEW
+      row[iPostcode] = postcode;
       row[iTracking] = tracking;
       row[iTStatus] = trackingStatus;
       row[iManifest] = manifest;
@@ -294,12 +267,12 @@ function upsertShipmentsFromRMRows_(rows, meta) {
       row[iImportedAt] = now;
       row[iSource] = meta.sourceFileName;
 
-      updatedAny = true;
+      changedRows.push(idx);
     } else {
       const row = new Array(headers.length).fill("");
       row[iShipmentID] = shipmentId;
       row[iOrderName] = orderName;
-      row[iPostcode] = postcode;              // NEW
+      row[iPostcode] = postcode;
       row[iTracking] = tracking;
       row[iTStatus] = trackingStatus;
       row[iManifest] = manifest;
@@ -311,28 +284,22 @@ function upsertShipmentsFromRMRows_(rows, meta) {
       row[iImportedAt] = now;
       row[iSource] = meta.sourceFileName;
 
-      toAppend.push(row);
+      appendRows.push(row);
       appendedCount++;
     }
   }
 
-  if (toAppend.length) {
-    sh.getRange(sh.getLastRow() + 1, 1, toAppend.length, headers.length).setValues(toAppend);
+  if (appendRows.length) {
+    sh.getRange(sh.getLastRow() + 1, 1, appendRows.length, headers.length).setValues(appendRows);
   }
-  if (updatedAny && existing.length) {
-    sh.getRange(2, 1, existing.length, headers.length).setValues(existing);
+
+  if (changedRows.length) {
+    writeRowsByRuns_(sh, existing, changedRows, headers.length);
   }
 
   return { appendedCount, orderNamesTouched: Array.from(touched) };
 }
 
-
-/**
- * Mirror Shipments -> Orders:
- * - newline-unique: tracking, manifest, batch numbers
- * - Hold protected
- * - If shipments exist: all delivered => Delivered else Despatched
- */
 function mirrorShipmentsToOrders_(orderNamesTouched) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const shO = ss.getSheetByName(CFG.SHEETS.ORDERS);
@@ -349,17 +316,15 @@ function mirrorShipmentsToOrders_(orderNamesTouched) {
   const cO = CFG.COLS.ORDERS;
   const cS = CFG.COLS.SHIPMENTS;
 
-  // Orders indices
   const iOName     = requireCol_(oMap, cO.OrderName);
   const iOStatus   = requireCol_(oMap, cO.Status);
-  const iOPostcode = requireCol_(oMap, cO.Postcode); // NEW (push postcode)
+  const iOPostcode = requireCol_(oMap, cO.Postcode);
   const iOBatch    = requireCol_(oMap, cO.RoyalMailBatchNumber);
   const iOTrack    = requireCol_(oMap, cO.RoyalMailTrackingNumber);
   const iOMani     = requireCol_(oMap, cO.RoyalMailManifestNo);
 
-  // Shipments indices
   const iSName     = requireCol_(sMap, cS.OrderName);
-  const iSPostcode = requireCol_(sMap, cS.Postcode); // NEW
+  const iSPostcode = requireCol_(sMap, cS.Postcode);
   const iSBatch    = requireCol_(sMap, cS.RoyalMailBatchNumber);
   const iSTrack    = requireCol_(sMap, cS.RoyalMailTrackingNumber);
   const iSMani     = requireCol_(sMap, cS.RoyalMailManifestNo);
@@ -367,17 +332,11 @@ function mirrorShipmentsToOrders_(orderNamesTouched) {
 
   const deliveredToken = normTrackingStatus_(CFG.ROYAL_MAIL.TRACKING_STATUS_DELIVERED || "Delivered");
 
-  // Read Shipments (can be optimized later; OK for now)
   const sLastRow = shS.getLastRow();
   const sLastCol = shS.getLastColumn();
   const sVals = (sLastRow >= 2) ? shS.getRange(2, 1, sLastRow - 1, sLastCol).getValues() : [];
 
-  // Aggregate per order:
-  // - newline fields: tracking, manifest, batch numbers
-  // - postcode: should be stable; if multiple, pick deterministic one (sorted first)
-  // - status: all delivered -> Delivered else Despatched (Hold protected)
-  const agg = new Map(); // orderName -> { tracks:Set, manifests:Set, batches:Set, postcodes:Set, statuses:Set, shipmentCount:number }
-
+  const agg = new Map();
   for (const r of sVals) {
     const on = String(r[iSName] || "").trim();
     if (!on || !touched.has(on)) continue;
@@ -392,6 +351,7 @@ function mirrorShipmentsToOrders_(orderNamesTouched) {
         shipmentCount: 0,
       });
     }
+
     const a = agg.get(on);
 
     const t = String(r[iSTrack] || "").trim();
@@ -409,21 +369,22 @@ function mirrorShipmentsToOrders_(orderNamesTouched) {
     a.shipmentCount++;
   }
 
-  // Read Orders
   const oLastRow = shO.getLastRow();
   const oLastCol = shO.getLastColumn();
   const oVals = (oLastRow >= 2) ? shO.getRange(2, 1, oLastRow - 1, oLastCol).getValues() : [];
 
-  let changed = 0;
+  const changedRows = [];
 
-  for (const row of oVals) {
+  for (let i = 0; i < oVals.length; i++) {
+    const row = oVals[i];
     const on = String(row[iOName] || "").trim();
     if (!on || !touched.has(on)) continue;
 
     const a = agg.get(on);
     if (!a) continue;
 
-    // Merge RM fields (newline-separated, stable)
+    const before = row.join("\u0001");
+
     const tracks = Array.from(a.tracks).sort().map(toRoyalMailTrackingUrl_).join("\n");
     const manifests = Array.from(a.manifests).sort().join("\n");
     const batches = Array.from(a.batches).sort().join("\n");
@@ -432,24 +393,13 @@ function mirrorShipmentsToOrders_(orderNamesTouched) {
     row[iOMani]  = mergeNewlineList_(row[iOMani], manifests);
     row[iOBatch] = mergeNewlineList_(row[iOBatch], batches);
 
-    // Push postcode to Orders once shipments exist (authoritative shipping postcode)
-    // If multiple postcodes exist (rare), pick a deterministic value (sorted first).
     if (a.shipmentCount > 0 && a.postcodes.size > 0) {
       const pc = Array.from(a.postcodes).sort()[0];
       row[iOPostcode] = pc;
     }
 
     const current = String(row[iOStatus] || "").trim();
-
-    // Hold protected
-    if (current === CFG.STATUS.HOLD) {
-      changed++;
-      continue;
-    }
-
-    // Once shipments exist, RM is authoritative for status:
-    // all delivered => Delivered, else Despatched.
-    if (a.shipmentCount > 0) {
+    if (current !== CFG.STATUS.HOLD && a.shipmentCount > 0) {
       const allDelivered =
         a.statuses.size > 0 &&
         Array.from(a.statuses).every(s => s === deliveredToken);
@@ -457,20 +407,13 @@ function mirrorShipmentsToOrders_(orderNamesTouched) {
       row[iOStatus] = allDelivered ? CFG.STATUS.DELIVERED : CFG.STATUS.DESPATCHED;
     }
 
-    changed++;
+    const after = row.join("\u0001");
+    if (after !== before) changedRows.push(i);
   }
 
-  if (changed) {
-    shO.getRange(2, 1, oVals.length, oLastCol).setValues(oVals);
-  }
+  if (changedRows.length) writeRowsByRuns_(shO, oVals, changedRows, oLastCol);
 }
 
-
-/**
- * Mirror Orders -> BatchOrders (for touched OrderNames only):
- * - BatchOrders.OrderStatus = Orders.OrderStatus
- * - BatchOrders.RoyalMailBatchNumber = Orders.RoyalMailBatchNumber (newline list)
- */
 function mirrorOrdersToBatchOrders_(orderNamesTouched) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const shBO = ss.getSheetByName(CFG.SHEETS.BATCH_ORDERS);
@@ -516,31 +459,27 @@ function mirrorOrdersToBatchOrders_(orderNamesTouched) {
   const boLastCol = shBO.getLastColumn();
   const boVals = (boLastRow >= 2) ? shBO.getRange(2, 1, boLastRow - 1, boLastCol).getValues() : [];
 
-  let changed = 0;
-
-  for (const row of boVals) {
+  const changedRows = [];
+  for (let i = 0; i < boVals.length; i++) {
+    const row = boVals[i];
     const on = String(row[iBoOrder] || "").trim();
     if (!on || !touched.has(on)) continue;
 
     const info = orderInfo.get(on);
     if (!info) continue;
 
+    const beforeStatus = String(row[iBoStatus] || "");
+    const beforeBatch = String(row[iBoRmBatch] || "");
+
     row[iBoStatus] = info.status;
     row[iBoRmBatch] = info.rmBatch;
-    changed++;
+
+    if (beforeStatus !== row[iBoStatus] || beforeBatch !== row[iBoRmBatch]) changedRows.push(i);
   }
 
-  if (changed) {
-    shBO.getRange(2, 1, boVals.length, boLastCol).setValues(boVals);
-  }
+  if (changedRows.length) writeRowsByRuns_(shBO, boVals, changedRows, boLastCol);
 }
 
-/**
- * Update Batches.RoyalMailBatchNumber shorthand based on BatchOrders:
- * - If exactly 1 distinct RM batch number in batch => that number
- * - If >1 => MULTI (n)
- * - SAFEGUARD: if none exist => don't overwrite manual placeholder in Batches
- */
 function updateBatchesRoyalMailShorthandFromBatchOrders_(orderNamesTouched) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const shBO = ss.getSheetByName(CFG.SHEETS.BATCH_ORDERS);
@@ -569,7 +508,6 @@ function updateBatchesRoyalMailShorthandFromBatchOrders_(orderNamesTouched) {
   const boVals = (boLastRow >= 2) ? shBO.getRange(2, 1, boLastRow - 1, boLastCol).getValues() : [];
 
   const batchToRm = new Map();
-
   for (const r of boVals) {
     const on = String(r[iBoOrder] || "").trim();
     if (!on || !touched.has(on)) continue;
@@ -595,27 +533,51 @@ function updateBatchesRoyalMailShorthandFromBatchOrders_(orderNamesTouched) {
   const bLastCol = shB.getLastColumn();
   const bVals = (bLastRow >= 2) ? shB.getRange(2, 1, bLastRow - 1, bLastCol).getValues() : [];
 
-  let changed = 0;
-
-  for (const row of bVals) {
+  const changedRows = [];
+  for (let i = 0; i < bVals.length; i++) {
+    const row = bVals[i];
     const batchId = String(row[iBBatch] || "").trim();
     if (!batchId || !batchToRm.has(batchId)) continue;
 
     const set = batchToRm.get(batchId);
-
-    // SAFEGUARD: no RM-derived values => leave manual placeholder untouched
     if (!set || set.size === 0) continue;
 
     let shorthand = "";
     if (set.size === 1) shorthand = Array.from(set)[0];
     else shorthand = `MULTI (${set.size})`;
 
-    row[iBRmBatch] = shorthand;
-    changed++;
+    if (String(row[iBRmBatch] || "") !== shorthand) {
+      row[iBRmBatch] = shorthand;
+      changedRows.push(i);
+    }
   }
 
-  if (changed) {
-    shB.getRange(2, 1, bVals.length, bLastCol).setValues(bVals);
-  }
+  if (changedRows.length) writeRowsByRuns_(shB, bVals, changedRows, bLastCol);
 }
 
+function writeRowsByRuns_(sh, values, changedRowIndices0, width) {
+  const sorted = Array.from(new Set(changedRowIndices0)).sort((a, b) => a - b);
+  if (!sorted.length) return;
+
+  let start = sorted[0];
+  let prev = start;
+
+  for (let i = 1; i < sorted.length; i++) {
+    const cur = sorted[i];
+    if (cur === prev + 1) {
+      prev = cur;
+    } else {
+      const num = prev - start + 1;
+      const block = new Array(num);
+      for (let j = 0; j < num; j++) block[j] = values[start + j];
+      sh.getRange(2 + start, 1, num, width).setValues(block);
+      start = cur;
+      prev = cur;
+    }
+  }
+
+  const num = prev - start + 1;
+  const block = new Array(num);
+  for (let j = 0; j < num; j++) block[j] = values[start + j];
+  sh.getRange(2 + start, 1, num, width).setValues(block);
+}
